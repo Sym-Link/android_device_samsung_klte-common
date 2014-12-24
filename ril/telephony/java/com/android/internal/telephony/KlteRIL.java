@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012-2014 The CyanogenMod Project
+ * Copyright (c) 2014, The CyanogenMod Project. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import android.os.AsyncResult;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.telephony.Rlog;
 import android.os.Message;
 import android.os.Parcel;
 import android.telephony.SmsMessage;
@@ -31,11 +32,12 @@ import android.os.SystemProperties;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
-import android.telephony.Rlog;
-
-import android.telephony.SignalStrength;
 
 import android.telephony.PhoneNumberUtils;
+import android.telephony.SignalStrength;
+import com.android.internal.telephony.uicc.IccCardApplicationStatus;
+import com.android.internal.telephony.uicc.IccCardStatus;
+
 import com.android.internal.telephony.RILConstants;
 import com.android.internal.telephony.gsm.SmsBroadcastConfigInfo;
 import com.android.internal.telephony.cdma.CdmaInformationRecords;
@@ -46,15 +48,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 
-import com.android.internal.telephony.uicc.IccCardApplicationStatus;
-import com.android.internal.telephony.uicc.IccCardStatus;
-
 /**
- * Qualcomm RIL for the Samsung family.
- * Quad core Exynos4 with Qualcomm modem and later is supported
- * Snapdragon S3 and later is supported
- * This RIL is univerisal meaning it supports CDMA and GSM radio.
- * Handles most GSM and CDMA cases.
+ * RIL customization for Galaxy S5 LTE devices
+ *
  * {@hide}
  */
 public class KlteRIL extends RIL implements CommandsInterface {
@@ -69,18 +65,47 @@ public class KlteRIL extends RIL implements CommandsInterface {
 
     private Message mPendingGetSimStatus;
 
-    public KlteRIL(Context context, int preferredNetworkType,
-            int cdmaSubscription, Integer instanceId) {
-        super(context, preferredNetworkType, cdmaSubscription);
-        mAudioManager = (AudioManager)mContext.getSystemService(Context.AUDIO_SERVICE);
-        mQANElements = SystemProperties.getInt("ro.ril.telephony.mqanelements", 4);
-    }
-
     public KlteRIL(Context context, int networkMode,
             int cdmaSubscription) {
         super(context, networkMode, cdmaSubscription);
         mAudioManager = (AudioManager)mContext.getSystemService(Context.AUDIO_SERVICE);
-        mQANElements = SystemProperties.getInt("ro.ril.telephony.mqanelements", 4);
+        mQANElements = 6;
+    }
+
+    public KlteRIL(Context context, int preferredNetworkType,
+            int cdmaSubscription, Integer instanceId) {
+        super(context, preferredNetworkType, cdmaSubscription);
+        mAudioManager = (AudioManager)mContext.getSystemService(Context.AUDIO_SERVICE);
+        mQANElements = 6;
+    }
+
+    @Override
+    public void
+    dial(String address, int clirMode, UUSInfo uusInfo, Message result) {
+        if (samsungEmergency && PhoneNumberUtils.isEmergencyNumber(address)) {
+            dialEmergencyCall(address, clirMode, result);
+            return;
+        }
+        RILRequest rr = RILRequest.obtain(RIL_REQUEST_DIAL, result);
+
+        rr.mParcel.writeString(address);
+        rr.mParcel.writeInt(clirMode);
+        rr.mParcel.writeInt(0);     // CallDetails.call_type
+        rr.mParcel.writeInt(1);     // CallDetails.call_domain
+        rr.mParcel.writeString(""); // CallDetails.getCsvFromExtras
+
+        if (uusInfo == null) {
+            rr.mParcel.writeInt(0); // UUS information is absent
+        } else {
+            rr.mParcel.writeInt(1); // UUS information is present
+            rr.mParcel.writeInt(uusInfo.getType());
+            rr.mParcel.writeInt(uusInfo.getDcs());
+            rr.mParcel.writeByteArray(uusInfo.getUserData());
+        }
+
+        if (RILJ_LOGD) riljLog(rr.serialString() + "> " + requestToString(rr.mRequest));
+
+        send(rr);
     }
 
     @Override
@@ -116,11 +141,12 @@ public class KlteRIL extends RIL implements CommandsInterface {
             appStatus.pin1_replaced  = p.readInt();
             appStatus.pin1           = appStatus.PinStateFromRILInt(p.readInt());
             appStatus.pin2           = appStatus.PinStateFromRILInt(p.readInt());
-            p.readInt(); // remaining_count_pin1 - pin1_num_retries
-            p.readInt(); // remaining_count_puk1 - puk1_num_retries
-            p.readInt(); // remaining_count_pin2 - pin2_num_retries
-            p.readInt(); // remaining_count_puk2 - puk2_num_retries
-            p.readInt(); // - perso_unblock_retries
+            p.readInt(); // pin1_num_retries
+            p.readInt(); // puk1_num_retries
+            p.readInt(); // pin2_num_retries
+            p.readInt(); // puk2_num_retries
+            p.readInt(); // perso_unblock_retries
+
             cardStatus.mApplications[i] = appStatus;
         }
         if (numApplications==1 && !isGSM && appStatus.app_type == appStatus.AppTypeFromRILInt(2)) {
@@ -523,10 +549,6 @@ public class KlteRIL extends RIL implements CommandsInterface {
                 return rr;
             }
         }
-
-        // Here and below fake RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, see b/7255789.
-        // This is needed otherwise we don't automatically transition to the main lock
-        // screen when the pin or puk is entered incorrectly.
         switch (rr.mRequest) {
             case RIL_REQUEST_ENTER_SIM_PUK:
             case RIL_REQUEST_ENTER_SIM_PUK2:
@@ -581,7 +603,7 @@ public class KlteRIL extends RIL implements CommandsInterface {
         }
         return response;
     }
-    
+
     private Object
     responseVoiceDataRegistrationState(Parcel p) {
         String response[] = (String[])responseStrings(p);
@@ -605,11 +627,6 @@ public class KlteRIL extends RIL implements CommandsInterface {
         return response;
     }
 
-    /**
-     * Set audio parameter "wb_amr" for HD-Voice (Wideband AMR).
-     *
-     * @param state: 0 = unsupported, 1 = supported.
-     */
     private void setWbAmr(int state) {
         if (state == 1) {
             Rlog.d(RILJ_LOG_TAG, "setWbAmr(): setting audio parameter - wb_amr=on");
@@ -620,41 +637,6 @@ public class KlteRIL extends RIL implements CommandsInterface {
         }
     }
 
-    // Workaround for Samsung CDMA "ring of death" bug:
-    //
-    // Symptom: As soon as the phone receives notice of an incoming call, an
-    // audible "old fashioned ring" is emitted through the earpiece and
-    // persists through the duration of the call, or until reboot if the call
-    // isn't answered.
-    //
-    // Background: The CDMA telephony stack implements a number of "signal info
-    // tones" that are locally generated by ToneGenerator and mixed into the
-    // voice call path in response to radio RIL_UNSOL_CDMA_INFO_REC requests.
-    // One of these tones, IS95_CONST_IR_SIG_IS54B_L, is requested by the
-    // radio just prior to notice of an incoming call when the voice call
-    // path is muted. CallNotifier is responsible for stopping all signal
-    // tones (by "playing" the TONE_CDMA_SIGNAL_OFF tone) upon receipt of a
-    // "new ringing connection", prior to unmuting the voice call path.
-    //
-    // Problem: CallNotifier's incoming call path is designed to minimize
-    // latency to notify users of incoming calls ASAP. Thus,
-    // SignalInfoTonePlayer requests are handled asynchronously by spawning a
-    // one-shot thread for each. Unfortunately the ToneGenerator API does
-    // not provide a mechanism to specify an ordering on requests, and thus,
-    // unexpected thread interleaving may result in ToneGenerator processing
-    // them in the opposite order that CallNotifier intended. In this case,
-    // playing the "signal off" tone first, followed by playing the "old
-    // fashioned ring" indefinitely.
-    //
-    // Solution: An API change to ToneGenerator is required to enable
-    // SignalInfoTonePlayer to impose an ordering on requests (i.e., drop any
-    // request that's older than the most recent observed). Such a change,
-    // or another appropriate fix should be implemented in AOSP first.
-    //
-    // Workaround: Intercept RIL_UNSOL_CDMA_INFO_REC requests from the radio,
-    // check for a signal info record matching IS95_CONST_IR_SIG_IS54B_L, and
-    // drop it so it's never seen by CallNotifier. If other signal tones are
-    // observed to cause this problem, they should be dropped here as well.
     @Override
     protected void notifyRegistrantsCdmaInfoRec(CdmaInformationRecords infoRec) {
         final int response = RIL_UNSOL_CDMA_INFO_REC;
@@ -691,37 +673,6 @@ public class KlteRIL extends RIL implements CommandsInterface {
         return super.responseSMS(p);
     }
 
-    @Override
-    public void
-    dial(String address, int clirMode, UUSInfo uusInfo, Message result) {
-        if (samsungEmergency && PhoneNumberUtils.isEmergencyNumber(address)) {
-            dialEmergencyCall(address, clirMode, result);
-            return;
-        }
-        RILRequest rr = RILRequest.obtain(RIL_REQUEST_DIAL, result);
-
-        rr.mParcel.writeString(address);
-        rr.mParcel.writeInt(clirMode);
-        rr.mParcel.writeInt(0);
-        rr.mParcel.writeInt(1);
-        rr.mParcel.writeString("");
-
-        if (uusInfo == null) {
-            rr.mParcel.writeInt(0); // UUS information is absent
-        } else {
-            rr.mParcel.writeInt(1); // UUS information is present
-            rr.mParcel.writeInt(uusInfo.getType());
-            rr.mParcel.writeInt(uusInfo.getDcs());
-            rr.mParcel.writeByteArray(uusInfo.getUserData());
-        }
-
-        if (RILJ_LOGD) riljLog(rr.serialString() + "> " + requestToString(rr.mRequest));
-
-        send(rr);
-    }
-
-    //this method is used in the search network functionality.
-    // in mobile network setting-> network operators
     @Override
     protected Object
     responseOperatorInfos(Parcel p) {
@@ -770,12 +721,14 @@ public class KlteRIL extends RIL implements CommandsInterface {
     public void
     dialEmergencyCall(String address, int clirMode, Message result) {
         RILRequest rr;
-        Rlog.v(RILJ_LOG_TAG, "Emergency dial: " + address);
 
         rr = RILRequest.obtain(RIL_REQUEST_DIAL_EMERGENCY, result);
-        rr.mParcel.writeString(address + "/");
+        rr.mParcel.writeString(address);
         rr.mParcel.writeInt(clirMode);
-        rr.mParcel.writeInt(0);  // UUS information is absent
+        rr.mParcel.writeInt(0);        // CallDetails.call_type
+        rr.mParcel.writeInt(3);        // CallDetails.call_domain
+        rr.mParcel.writeString("");    // CallDetails.getCsvFromExtra
+        rr.mParcel.writeInt(0);        // Unknown
 
         if (RILJ_LOGD) riljLog(rr.serialString() + "> " + requestToString(rr.mRequest));
 
